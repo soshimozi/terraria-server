@@ -12,6 +12,8 @@ import * as lambda from 'aws-cdk-lib/aws-lambda-nodejs'
 import * as s3 from 'aws-cdk-lib/aws-s3'
 import * as s3deploy from 'aws-cdk-lib/aws-s3-deployment'
 import * as subscriptions from 'aws-cdk-lib/aws-sns-subscriptions'
+import * as route53 from 'aws-cdk-lib/aws-route53'
+import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
 
 import { Topic } from 'aws-cdk-lib/aws-sns'
 
@@ -45,7 +47,9 @@ const instanceTypes : InstanceTypes = {
 interface TerrariaServerStackProps extends cdk.StackProps {
       // The IAM keypair associated with your root account or ideally your IAM user you use the CLI with.
       keyName: string
-
+      serverDomainName: string,
+      apiKey: string,
+      apiSecret: string,
       // (Optional) The name of the world file
       worldFileName?: string // Default 'world.wld'
       // (Optional) Container type/size
@@ -64,6 +68,9 @@ export class TerrariaServerStack extends cdk.Stack {
 
         const {
             keyName,
+            serverDomainName,
+            apiKey,
+            apiSecret,
             s3Files,
             overwriteServerFiles,
         } = props
@@ -75,6 +82,30 @@ export class TerrariaServerStack extends cdk.Stack {
         const worldFileName = props.worldFileName || 'world.wld'
 
         const {instanceClass, cpuType} = instanceTypes[instanceType]
+
+        // Route53
+        
+        // // Create a new hosted zone
+        // const zone = new route53.HostedZone(this, 'HostedZone', {
+        //     zoneName: serverDomainName
+        // });
+
+        // // Create an A record in the hosted zone with a "parked" IP
+        // new route53.ARecord(this, '${service}-ARecord', {
+        //     zone: zone,
+        //     recordName: `terraria.${serverDomainName}`,
+        //     target: route53.RecordTarget.fromIpAddresses('0.0.0.0'), // "parked"  IP
+        //     ttl: cdk.Duration.minutes(5),
+        // })
+
+
+        // Secrets Manager
+        const secret = new secretsmanager.Secret(this, `${service}-ApiSecret`, {
+            generateSecretString: {
+              secretStringTemplate: JSON.stringify({ apiKey, apiSecret }),
+              generateStringKey: 'password',
+            },
+        });
 
         // S3
         const bucket = new s3.Bucket(this, 'ServerFiles', {versioned: true})
@@ -93,6 +124,9 @@ export class TerrariaServerStack extends cdk.Stack {
             .replace(new RegExp('s3BucketName', 'g'), bucket.bucketName)
             .replace(new RegExp('worldFileName', 'g'), worldFileName)
             .replace(new RegExp('regionName', 'g'), region)
+            .replace(new RegExp('secretName', 'g'), secret.secretName)
+            .replace(new RegExp('domainName', 'g'), serverDomainName)
+            .replace(new RegExp('subDomainName', 'g'), 'terraria')
 
         const userData = ec2.UserData.forLinux()
         userData.addCommands(commandsReplaced)
@@ -132,8 +166,33 @@ export class TerrariaServerStack extends cdk.Stack {
             }),
         }))        
 
-        const {instanceId} = ec2Instance
 
+        // ec2 access route53
+        // ec2Instance.role?.attachInlinePolicy(new iam.Policy(this, `${service}-AccessRoute53`, {
+        //     document: new iam.PolicyDocument({
+        //         statements: [new iam.PolicyStatement({
+        //             effect: iam.Effect.ALLOW,
+        //             actions: [
+        //                 'route53:ChangeResourceRecordSets',
+        //                 'route53:ListResourceRecordSets',
+        //                 'route53:GetChange'                        
+        //             ],
+        //             resources: [zone.hostedZoneArn],
+        //         })],
+        //     }),
+        // }))        
+
+        // ec2 access secrets manager
+        ec2Instance.role?.attachInlinePolicy(new iam.Policy(this, `${service}-AccessSecretsManager`, {
+            document: new iam.PolicyDocument({
+                statements: [new iam.PolicyStatement({
+                    actions: ['secretsmanager:GetSecretValue'],
+                    resources: [secret.secretArn]
+                })],
+            }),
+        }))
+
+        const {instanceId} = ec2Instance
 
         // Lambdas
         const lambdaDir = path.join(__dirname, 'lambdas')
@@ -185,5 +244,6 @@ export class TerrariaServerStack extends cdk.Stack {
             treatMissingData: cloudwatch.TreatMissingData.MISSING,
             alarmName: `${service}- No active connections`
         }).addAlarmAction(new cloudwatch_actions.SnsAction(topic))        
+
     }
 }

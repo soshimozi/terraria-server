@@ -5,6 +5,10 @@
     "terraria-server": "bin/terraria-server.js"
   },
   "scripts": {
+    "predeploy": "cdk synth",
+    "deploy": "cdk deploy",
+    "destroy": "cdk destroy",
+    "diff": "cdk diff",
     "build": "tsc",
     "watch": "tsc -w",
     "test": "jest",
