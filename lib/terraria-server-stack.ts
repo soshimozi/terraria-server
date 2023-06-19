@@ -16,6 +16,7 @@ import * as route53 from 'aws-cdk-lib/aws-route53'
 import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
 
 import { Topic } from 'aws-cdk-lib/aws-sns'
+import { Duration } from 'aws-cdk-lib'
 
 const generation = ec2.AmazonLinuxGeneration.AMAZON_LINUX_2
 
@@ -50,6 +51,9 @@ interface TerrariaServerStackProps extends cdk.StackProps {
       serverDomainName: string,
       apiKey: string,
       apiSecret: string,
+      issuer: string,
+      jwksUri: string,
+      audience: string,
       // (Optional) The name of the world file
       worldFileName?: string // Default 'world.wld'
       // (Optional) Container type/size
@@ -71,6 +75,9 @@ export class TerrariaServerStack extends cdk.Stack {
             serverDomainName,
             apiKey,
             apiSecret,
+            issuer,
+            jwksUri,
+            audience,
             s3Files,
             overwriteServerFiles,
         } = props
@@ -82,22 +89,6 @@ export class TerrariaServerStack extends cdk.Stack {
         const worldFileName = props.worldFileName || 'world.wld'
 
         const {instanceClass, cpuType} = instanceTypes[instanceType]
-
-        // Route53
-        
-        // // Create a new hosted zone
-        // const zone = new route53.HostedZone(this, 'HostedZone', {
-        //     zoneName: serverDomainName
-        // });
-
-        // // Create an A record in the hosted zone with a "parked" IP
-        // new route53.ARecord(this, '${service}-ARecord', {
-        //     zone: zone,
-        //     recordName: `terraria.${serverDomainName}`,
-        //     target: route53.RecordTarget.fromIpAddresses('0.0.0.0'), // "parked"  IP
-        //     ttl: cdk.Duration.minutes(5),
-        // })
-
 
         // Secrets Manager
         const secret = new secretsmanager.Secret(this, `${service}-ApiSecret`, {
@@ -166,22 +157,6 @@ export class TerrariaServerStack extends cdk.Stack {
             }),
         }))        
 
-
-        // ec2 access route53
-        // ec2Instance.role?.attachInlinePolicy(new iam.Policy(this, `${service}-AccessRoute53`, {
-        //     document: new iam.PolicyDocument({
-        //         statements: [new iam.PolicyStatement({
-        //             effect: iam.Effect.ALLOW,
-        //             actions: [
-        //                 'route53:ChangeResourceRecordSets',
-        //                 'route53:ListResourceRecordSets',
-        //                 'route53:GetChange'                        
-        //             ],
-        //             resources: [zone.hostedZoneArn],
-        //         })],
-        //     }),
-        // }))        
-
         // ec2 access secrets manager
         ec2Instance.role?.attachInlinePolicy(new iam.Policy(this, `${service}-AccessSecretsManager`, {
             document: new iam.PolicyDocument({
@@ -196,6 +171,65 @@ export class TerrariaServerStack extends cdk.Stack {
 
         // Lambdas
         const lambdaDir = path.join(__dirname, 'lambdas')
+
+        const startLambda = new lambda.NodejsFunction(this, `${service}-StartServerLambda`, {
+            entry: path.join(lambdaDir, 'start-lambda.ts'),
+            handler: 'handler',
+            functionName: `${service}-StartServerLambda`,
+            environment: {
+                'INSTANCE_ID': instanceId,
+                'REGION': region,
+            },
+        })
+
+        startLambda.role
+        ?.attachInlinePolicy( new iam.Policy(this, `${service}-StartEc2Policy`, {
+            document: new iam.PolicyDocument({
+                statements: [new iam.PolicyStatement({
+                    actions: ['ec2:StartInstances'],
+                    resources: ['*']
+                })],
+            }),
+        }))
+
+        const stopLambda = new lambda.NodejsFunction(this, `${service}-StopServerLambda`, {
+            entry: path.join(lambdaDir, 'stop-lambda.ts'),
+            handler: 'handler',
+            functionName: `${service}-StopServerLambda`,
+            environment: {
+              'INSTANCE_ID': instanceId,
+              'REGION': region,
+            },
+        })
+
+        stopLambda.role?.attachInlinePolicy(new iam.Policy(this, `${service}-StopEc2Policy`, {
+            document: new iam.PolicyDocument({
+                statements: [new iam.PolicyStatement({
+                    actions: ['ec2:StopInstances'],
+                    resources: ['*'],
+                })],
+            }),
+        }))
+        
+        const statusLambda = new lambda.NodejsFunction(this, `${service}-ServerStatusLambda`, {
+            entry: path.join(lambdaDir, 'status-lambda.ts'),
+            handler: 'handler',
+            functionName: `${service}-ServerStatusLambda`,
+            environment: {
+                'INSTANCE_ID': instanceId,
+                'REGION': region,
+            },
+        })
+
+        statusLambda.role?.attachInlinePolicy(new iam.Policy(this, `${service}-Ec2StatusPolicy`, {
+            document: new iam.PolicyDocument({
+                statements: [new iam.PolicyStatement({
+                    actions: ['ec2:DescribeInstanceStatus'],
+                    resources: ['*'],
+                })],
+            }),
+        }))        
+
 
         const noActiveConnectionsLambda = new lambda.NodejsFunction(this, `${service}-NoConnectionAlarmHandlerLambda`, {
             entry: path.join(lambdaDir, 'no-active-connections-handler-lambda.ts'),
@@ -216,7 +250,20 @@ export class TerrariaServerStack extends cdk.Stack {
             }),
         }))
 
-                // API Gateway
+        const authorizerLambda = new lambda.NodejsFunction(this, `${service}-AuthorizerLambda`, {
+            entry: path.join(lambdaDir, 'authorizer-lambda.ts'),
+            handler: 'handler',
+            functionName: `${service}-AuthorizerLambda`,
+            environment: {
+                'INSTANCE_ID': instanceId,
+                'REGION': region,
+                'ISSUER': issuer,
+                'JWS_URI': jwksUri,
+                'AUDIENCE': audience
+            },
+        }) 
+
+        // API Gateway
         const api = new apigateway.RestApi(this, `${service}-ServerAPI`, {
             defaultCorsPreflightOptions: {
                 allowOrigins: apigateway.Cors.ALL_ORIGINS,
@@ -224,6 +271,25 @@ export class TerrariaServerStack extends cdk.Stack {
                 allowHeaders: ['Authorization'],
             }
         })
+
+        const authorizer = new apigateway.RequestAuthorizer(this, `${service}-ServerAuthorizer`, {
+            handler: authorizerLambda,
+            identitySources: [apigateway.IdentitySource.header('Authorization')],
+            resultsCacheTtl: Duration.seconds(0),
+        })
+        
+        api.root
+        .addResource('start')
+        .addMethod('POST', new apigateway.LambdaIntegration(startLambda), { authorizer })
+
+        api.root
+        .addResource('stop')
+        .addMethod('POST', new apigateway.LambdaIntegration(stopLambda), { authorizer })
+
+        api.root
+        .addResource('status')
+        .addMethod('GET', new apigateway.LambdaIntegration(statusLambda))
+        
 
         const topic = new Topic(this, `${service}-connections-alarm`)
         topic.addSubscription(new subscriptions.LambdaSubscription(noActiveConnectionsLambda))

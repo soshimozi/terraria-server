@@ -5,6 +5,7 @@ HOME=/home/ec2-user
 
 # Install docker
 sudo yum update -y
+sudo yum install jq -y
 sudo amazon-linux-extras install docker
 sudo service docker start
 sudo usermod -aG docker ec2-user
@@ -113,7 +114,7 @@ SECRET_VALUE=$(aws secretsmanager get-secret-value --secret-id $SECRET_NAME --re
 
 # Parse the secret JSON string
 APIKEY=$(echo $SECRET_VALUE | jq -r .apiKey)
-APIKEY=$(echo $SECRET_VALUE | jq -r .apiSecret)
+APISECRET=$(echo $SECRET_VALUE | jq -r .apiSecret)
 
 #Enter vaules for all variables, Latest API call requries them.
 
